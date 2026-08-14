@@ -1,10 +1,12 @@
 import os
-import time
 import uuid
 from pathlib import Path
+from typing import Literal, Optional
 
-from flask import Flask, request, jsonify, Response, stream_with_context
-from flask_cors import CORS
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from groq import Groq
 
 # ---------------------------------------------------------------------------
@@ -16,22 +18,21 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 MAX_HISTORY_MESSAGES = int(os.environ.get("MAX_HISTORY_MESSAGES", "40"))
 TEMPERATURE = float(os.environ.get("TEMPERATURE", "0.8"))
 MAX_TOKENS = int(os.environ.get("MAX_TOKENS", "1024"))
+ALLOWED_ORIGINS = os.environ.get("ALLOWED_ORIGINS", "*")
 
 if not GROQ_API_KEY:
-    print("WARNING: GROQ_API_KEY is not set. Set it in your environment / Railway variables.")
+    print("WARNING: GROQ_API_KEY is not set. Set it in your environment / Render dashboard.")
 
 client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
 
-# Load the Mini-Me system prompt from disk once at startup.
 SYSTEM_PROMPT_PATH = Path(__file__).parent / "system_prompt.md"
 SYSTEM_PROMPT = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8")
 
 # ---------------------------------------------------------------------------
-# In-memory session store (simple prototype-level "memory")
+# In-memory session store (prototype-level "memory")
 # ---------------------------------------------------------------------------
-# NOTE: this is a prototype-grade store. It lives in process memory, so it
-# resets on redeploy/restart and won't be shared across multiple Railway
-# instances. If you outgrow it, swap this dict for Redis/Postgres later.
+# Lives in process memory: resets on redeploy/restart, not shared across
+# multiple instances. Swap for Redis/Postgres later if you need that.
 
 SESSIONS: dict[str, list[dict]] = {}
 
@@ -47,58 +48,79 @@ def trim_history(history: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Flask app
+# Schemas
 # ---------------------------------------------------------------------------
 
-app = Flask(__name__)
-CORS(app)  # allow your frontend (web/mobile) to call this from any origin
+class Message(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+    history: Optional[list[Message]] = None
+    stream: bool = False
+
+
+class ChatResponse(BaseModel):
+    reply: str
+    session_id: Optional[str] = None
+    history: list[Message]
+    model: str
+
+
+class SessionResponse(BaseModel):
+    session_id: str
+
+
+# ---------------------------------------------------------------------------
+# App
+# ---------------------------------------------------------------------------
+
+app = FastAPI(title="Mini-Me Backend", version="1.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in ALLOWED_ORIGINS.split(",")],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.get("/")
 def root():
-    return jsonify(
-        {
-            "status": "ok",
-            "service": "mini-me-backend",
-            "model": GROQ_MODEL,
-        }
-    )
+    return {"status": "ok", "service": "mini-me-backend", "model": GROQ_MODEL}
 
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "healthy"})
+    return {"status": "healthy"}
 
 
-@app.post("/session")
+@app.post("/session", response_model=SessionResponse)
 def create_session():
-    """Create a fresh conversation session and return its id."""
     session_id = str(uuid.uuid4())
     SESSIONS[session_id] = []
-    return jsonify({"session_id": session_id})
+    return SessionResponse(session_id=session_id)
 
 
-@app.delete("/session/<session_id>")
+@app.delete("/session/{session_id}")
 def reset_session(session_id: str):
     SESSIONS.pop(session_id, None)
-    return jsonify({"status": "cleared", "session_id": session_id})
+    return {"status": "cleared", "session_id": session_id}
 
 
-def build_messages(session_id: str | None, client_history: list | None, user_message: str):
-    """
-    Two supported modes:
-      1) Stateful: pass "session_id" -> server keeps history in memory.
-      2) Stateless: pass full "history" array from the client each call.
-    If neither is given, it's treated as a single-turn conversation.
-    """
-    if session_id:
-        history = get_session_history(session_id)
-    elif client_history:
-        history = client_history
+def build_messages(req: ChatRequest):
+    if req.session_id:
+        history = get_session_history(req.session_id)
+    elif req.history:
+        history = [m.model_dump() for m in req.history]
     else:
         history = []
 
-    history.append({"role": "user", "content": user_message})
+    history.append({"role": "user", "content": req.message})
     history[:] = trim_history(history)
 
     messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
@@ -106,36 +128,19 @@ def build_messages(session_id: str | None, client_history: list | None, user_mes
 
 
 @app.post("/chat")
-def chat():
-    """
-    Request body (JSON):
-    {
-      "message": "hey what's up",
-      "session_id": "optional-uuid",       // for server-side memory
-      "history": [ {role, content}, ... ], // optional, for stateless clients
-      "stream": false
-    }
-    """
+def chat(req: ChatRequest):
     if client is None:
-        return jsonify({"error": "GROQ_API_KEY is not configured on the server."}), 500
+        raise HTTPException(status_code=500, detail="GROQ_API_KEY is not configured on the server.")
 
-    data = request.get_json(silent=True) or {}
-    user_message = (data.get("message") or "").strip()
-    session_id = data.get("session_id")
-    client_history = data.get("history")
-    stream = bool(data.get("stream", False))
+    if not req.message or not req.message.strip():
+        raise HTTPException(status_code=400, detail="'message' is required.")
 
-    if not user_message:
-        return jsonify({"error": "'message' is required."}), 400
+    messages, history = build_messages(req)
 
-    messages, history = build_messages(session_id, client_history, user_message)
-
-    if stream:
-        return Response(
-            stream_with_context(
-                _stream_response(messages, history, session_id)
-            ),
-            mimetype="text/event-stream",
+    if req.stream:
+        return StreamingResponse(
+            _stream_response(messages, history, req.session_id),
+            media_type="text/event-stream",
         )
 
     try:
@@ -146,26 +151,23 @@ def chat():
             max_tokens=MAX_TOKENS,
         )
     except Exception as e:
-        return jsonify({"error": f"Groq API error: {e}"}), 502
+        raise HTTPException(status_code=502, detail=f"Groq API error: {e}")
 
     reply = completion.choices[0].message.content
-
     history.append({"role": "assistant", "content": reply})
-    if session_id:
-        SESSIONS[session_id] = trim_history(history)
 
-    return jsonify(
-        {
-            "reply": reply,
-            "session_id": session_id,
-            "history": history,
-            "model": GROQ_MODEL,
-        }
+    if req.session_id:
+        SESSIONS[req.session_id] = trim_history(history)
+
+    return ChatResponse(
+        reply=reply,
+        session_id=req.session_id,
+        history=history,
+        model=GROQ_MODEL,
     )
 
 
 def _stream_response(messages, history, session_id):
-    """Server-Sent Events generator for streaming replies."""
     full_reply = ""
     try:
         stream = client.chat.completions.create(
@@ -192,5 +194,7 @@ def _stream_response(messages, history, session_id):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    import uvicorn
+
+    port = int(os.environ.get("PORT", "8000"))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
